@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Debian dual-NIC setup (Option A, auto-detect camera IP):
+# - enp2s0: main LAN via DHCP (default route via 10.10.10.1, whatever DHCP provides)
+# - enp1s0: camera LAN via DHCP reservation (NO default route)
+# - policy routing: traffic sourced from enp1s0's *current* IPv4 uses table 100
+#   to reach 192.168.1.0/24 via 10.10.80.1
+#
+# This avoids hardcoding 10.10.80.24 vs 10.10.80.25.
+
+# ---- EDIT IF NEEDED ----
+MAIN_IF="enp2s0"
+CAM_IF="enp1s0"
+
+CAMERA_GW="10.10.80.1"
+REMOTE_LAN_CIDR="192.168.1.0/24"
+
+RT_TABLE_ID="100"
+RULE_PRIO="10000"   # pick a high priority to avoid collisions
+# ------------------------
+
+need_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    echo "Run as root: sudo $0"
+    exit 1
+  fi
+}
+
+need_cmds() {
+  for c in ip ifup ifdown systemctl; do
+    command -v "$c" >/dev/null 2>&1 || { echo "Missing command: $c"; exit 1; }
+  done
+}
+
+backup_file() {
+  local f="$1"
+  if [[ -f "$f" ]]; then
+    cp -a "$f" "${f}.bak.$(date +%Y%m%d%H%M%S)"
+  fi
+}
+
+write_interfaces() {
+  local f="/etc/network/interfaces"
+  backup_file "$f"
+  cat >"$f" <<EOF
+# /etc/network/interfaces
+# ifupdown configuration
+
+source /etc/network/interfaces.d/*
+
+auto lo
+iface lo inet loopback
+
+allow-hotplug ${MAIN_IF}
+iface ${MAIN_IF} inet dhcp
+
+allow-hotplug ${CAM_IF}
+iface ${CAM_IF} inet dhcp
+EOF
+}
+
+write_dhcpcd_conf() {
+  local f="/etc/dhcpcd.conf"
+  backup_file "$f"
+
+  [[ -f "$f" ]] || : >"$f"
+
+  # Remove previous block if present
+  sed -i '/^# BEGIN PACNET MULTIHOME$/,/^# END PACNET MULTIHOME$/d' "$f"
+
+  cat >>"$f" <<EOF
+
+# BEGIN PACNET MULTIHOME
+interface ${MAIN_IF}
+  metric 100
+
+interface ${CAM_IF}
+  metric 1000
+  nogateway
+# END PACNET MULTIHOME
+EOF
+}
+
+write_sysctl_multihome() {
+  local f="/etc/sysctl.d/99-multihome.conf"
+  backup_file "$f"
+  cat >"$f" <<EOF
+net.ipv4.conf.all.rp_filter=1
+net.ipv4.conf.default.rp_filter=1
+net.ipv4.conf.${CAM_IF}.rp_filter=1
+net.ipv4.conf.${MAIN_IF}.rp_filter=1
+EOF
+}
+
+write_ifupdown_hooks() {
+  local up="/etc/network/if-up.d/99-pacnet-policy-route"
+  local down="/etc/network/if-down.d/99-pacnet-policy-route"
+
+  backup_file "$up"
+  backup_file "$down"
+
+  cat >"$up" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ifupdown provides IFACE; only act on the camera interface
+CAM_IF="__CAM_IF__"
+REMOTE_LAN_CIDR="__REMOTE_LAN_CIDR__"
+CAMERA_GW="__CAMERA_GW__"
+RT_TABLE_ID="__RT_TABLE_ID__"
+RULE_PRIO="__RULE_PRIO__"
+
+[[ "${IFACE:-}" == "$CAM_IF" ]] || exit 0
+
+# Get current global IPv4 on the camera interface (e.g. 10.10.80.24)
+CAM_IP="$(ip -4 -o addr show dev "$CAM_IF" scope global | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)"
+[[ -n "$CAM_IP" ]] || exit 0
+
+# Ensure the route exists in the dedicated table
+ip route replace "$REMOTE_LAN_CIDR" via "$CAMERA_GW" dev "$CAM_IF" table "$RT_TABLE_ID"
+
+# Replace the rule at a fixed priority (delete-by-priority is simple + robust)
+ip rule del priority "$RULE_PRIO" 2>/dev/null || true
+ip rule add from "$CAM_IP/32" table "$RT_TABLE_ID" priority "$RULE_PRIO"
+
+ip route flush cache 2>/dev/null || true
+EOF
+
+  # Replace placeholders
+  sed -i \
+    -e "s|__CAM_IF__|${CAM_IF}|g" \
+    -e "s|__REMOTE_LAN_CIDR__|${REMOTE_LAN_CIDR}|g" \
+    -e "s|__CAMERA_GW__|${CAMERA_GW}|g" \
+    -e "s|__RT_TABLE_ID__|${RT_TABLE_ID}|g" \
+    -e "s|__RULE_PRIO__|${RULE_PRIO}|g" \
+    "$up"
+
+  cat >"$down" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+CAM_IF="__CAM_IF__"
+REMOTE_LAN_CIDR="__REMOTE_LAN_CIDR__"
+CAMERA_GW="__CAMERA_GW__"
+RT_TABLE_ID="__RT_TABLE_ID__"
+RULE_PRIO="__RULE_PRIO__"
+
+[[ "${IFACE:-}" == "$CAM_IF" ]] || exit 0
+
+ip rule del priority "$RULE_PRIO" 2>/dev/null || true
+ip route del "$REMOTE_LAN_CIDR" via "$CAMERA_GW" dev "$CAM_IF" table "$RT_TABLE_ID" 2>/dev/null || true
+ip route flush cache 2>/dev/null || true
+EOF
+
+  sed -i \
+    -e "s|__CAM_IF__|${CAM_IF}|g" \
+    -e "s|__REMOTE_LAN_CIDR__|${REMOTE_LAN_CIDR}|g" \
+    -e "s|__CAMERA_GW__|${CAMERA_GW}|g" \
+    -e "s|__RT_TABLE_ID__|${RT_TABLE_ID}|g" \
+    -e "s|__RULE_PRIO__|${RULE_PRIO}|g" \
+    "$down"
+
+  chmod +x "$up" "$down"
+}
+
+apply_now() {
+  systemctl restart systemd-sysctl || true
+
+  # Bounce interfaces; do main first so default route comes back quickly
+  ifdown --force "${CAM_IF}" "${MAIN_IF}" 2>/dev/null || true
+  ifup "${MAIN_IF}"
+  ifup "${CAM_IF}"
+
+  ip route flush cache 2>/dev/null || true
+}
+
+verify() {
+  echo "=== ip -br addr ==="
+  ip -br addr
+  echo
+  echo "=== ip route ==="
+  ip route
+  echo
+  echo "=== ip rule show ==="
+  ip rule show
+  echo
+  echo "=== ip route show table ${RT_TABLE_ID} ==="
+  ip route show table "${RT_TABLE_ID}"
+  echo
+  echo "=== route decision checks ==="
+  ip route get 192.168.1.100 from 10.10.10.25 2>/dev/null || true
+  # camera source IP is auto-detected
+  CAM_IP="$(ip -4 -o addr show dev "${CAM_IF}" scope global | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)"
+  if [[ -n "$CAM_IP" ]]; then
+    ip route get 192.168.1.100 from "$CAM_IP" 2>/dev/null || true
+  else
+    echo "Could not detect IPv4 on ${CAM_IF} yet."
+  fi
+}
+
+need_root
+need_cmds
+
+write_interfaces
+write_dhcpcd_conf
+write_sysctl_multihome
+write_ifupdown_hooks
+
+apply_now
+verify
+
+echo
+echo "Done."
+echo "Policy routing is now based on whatever IPv4 DHCP gives ${CAM_IF} (no hardcoded 10.10.80.24/.25)."
