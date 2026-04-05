@@ -1,0 +1,15 @@
+How to run
+Save the script as setup-systemd-networkd-policy.sh.
+
+Make it executable:
+sudo chmod +x setup-systemd-networkd-policy.sh
+Run as root:
+sudo ./setup-systemd-networkd-policy.sh
+
+Notes and optional adjustments
+DHCP gateway changes: the script writes static default routes into the per-table configuration.
+If your DHCP gateway can change, I can add a networkd dispatch script that updates the per-table default when DHCP lease changes.
+
+Subnet vs single IP: the script uses the CAM_FROM and MAIN_FROM variables. Set them to /24 values if you prefer matching whole subnets.
+
+rp_filter: the script does not change rp_filter. If you need to adjust rp_filter for multihoming, I can add a sysctl file with recommended values.
